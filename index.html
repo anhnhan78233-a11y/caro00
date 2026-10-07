@@ -1,0 +1,430 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+// --- 1. GIAO DIỆN CLIENT (Tích hợp trực tiếp HTML/CSS/JS) ---
+const htmlContent = `
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Game Caro 15x15</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        body { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; background-color: #f4f7f6; }
+        
+        /* Lobby UI */
+        #lobby { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; width: 360px; }
+        #lobby h1 { margin-bottom: 20px; color: #333; }
+        .btn { width: 100%; padding: 12px; margin: 8px 0; border: none; border-radius: 6px; background: #007bff; color: white; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        .btn:hover { background: #0056b3; }
+        .input-group { margin: 10px 0; display: flex; gap: 5px; }
+        input[type="text"] { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 6px; text-align: center; font-size: 16px; }
+
+        /* Game UI */
+        #game { display: none; flex-direction: column; align-items: center; }
+        #status { font-size: 20px; font-weight: bold; margin-bottom: 15px; color: #333; }
+        #board { display: grid; grid-template-columns: repeat(15, 32px); grid-template-rows: repeat(15, 32px); gap: 1px; background: #ccc; border: 2px solid #333; }
+        .cell { width: 32px; height: 32px; background: #fff; display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: bold; cursor: pointer; user-select: none; }
+        .cell:hover { background: #e9e9e9; }
+        .cell.x { color: #d9534f; }
+        .cell.o { color: #0275d8; }
+
+        /* Modal Thông báo */
+        #modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); justify-content: center; align-items: center; }
+        .modal-content { background: white; padding: 25px; border-radius: 10px; text-align: center; max-width: 320px; }
+        .modal-content h2 { margin-bottom: 15px; }
+        .modal-btns { display: flex; gap: 10px; margin-top: 15px; }
+    </style>
+</head>
+<body>
+
+    <div id="lobby">
+        <h1>Game Caro 15x15</h1>
+        <div>
+            <div class="input-group">
+                <input type="text" id="roomIdInput" placeholder="Mã phòng (5 chữ số)" maxlength="5">
+                <button class="btn" style="width: auto;" onclick="createRoom()">Tạo</button>
+            </div>
+            <button class="btn" onclick="joinRoom()" style="background: #28a745;">Vào phòng theo mã</button>
+        </div>
+        <hr style="margin: 15px 0;">
+        <button class="btn" onclick="startQuickMatch()" style="background: #17a2b8;">Ghép ngẫu nhiên</button>
+        <button class="btn" onclick="startVsAI()" style="background: #6c757d;">Chơi với Máy (AI)</button>
+    </div>
+
+    <div id="game">
+        <div id="status">Đang tải...</div>
+        <div id="board"></div>
+    </div>
+
+    <div id="modal">
+        <div class="modal-content">
+            <h2 id="modalText">Kết quả</h2>
+            <p>Bạn có muốn tiếp tục chơi chế độ này không?</p>
+            <div class="modal-btns">
+                <button class="btn" onclick="playAgain()">Tiếp tục</button>
+                <button class="btn" style="background: #dc3545;" onclick="backToLobby()">Về Menu</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        const BOARD_SIZE = 15;
+        let board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(null));
+        let mode = null; 
+        let mySymbol = 'X';
+        let isMyTurn = false;
+        let gameActive = false;
+
+        const lobbyEl = document.getElementById('lobby');
+        const gameEl = document.getElementById('game');
+        const boardEl = document.getElementById('board');
+        const statusEl = document.getElementById('status');
+        const modalEl = document.getElementById('modal');
+        const modalTextEl = document.getElementById('modalText');
+
+        function renderBoard() {
+            boardEl.innerHTML = '';
+            for (let r = 0; r < BOARD_SIZE; r++) {
+                for (let c = 0; c < BOARD_SIZE; c++) {
+                    const cell = document.createElement('div');
+                    cell.classList.add('cell');
+                    cell.addEventListener('click', () => handleCellClick(r, c));
+                    boardEl.appendChild(cell);
+                }
+            }
+        }
+
+        function resetGameData() {
+            board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(null));
+            renderBoard();
+            gameActive = true;
+        }
+
+        function updateStatus() {
+            if (!gameActive) return;
+            statusEl.innerText = isMyTurn ? \`Lượt của bạn (\${mySymbol})\` : \`Lượt đối thủ (\${mySymbol === 'X' ? 'O' : 'X'})\`;
+        }
+
+        function handleCellClick(r, c) {
+            if (!gameActive || !isMyTurn || board[r][c] !== null) return;
+
+            makeMove(r, c, mySymbol);
+
+            if (checkWin(r, c, mySymbol)) {
+                endGame(true);
+                return;
+            }
+
+            isMyTurn = false;
+            updateStatus();
+
+            if (mode === 'ai') {
+                setTimeout(aiMove, 300);
+            } else {
+                socket.emit('makeMove', { row: r, col: c });
+            }
+        }
+
+        function makeMove(r, c, symbol) {
+            board[r][c] = symbol;
+            const index = r * BOARD_SIZE + c;
+            const cell = boardEl.children[index];
+            cell.innerText = symbol;
+            cell.classList.add(symbol.toLowerCase());
+        }
+
+        function checkWin(r, c, symbol) {
+            const dirs = [
+                [{r:0, c:1}, {r:0, c:-1}],
+                [{r:1, c:0}, {r:-1, c:0}],
+                [{r:1, c:1}, {r:-1, c:-1}],
+                [{r:1, c:-1}, {r:-1, c:1}]
+            ];
+
+            for (let d of dirs) {
+                let count = 1;
+                for (let dir of d) {
+                    let currR = r + dir.r, currC = c + dir.c;
+                    while (currR >= 0 && currR < BOARD_SIZE && currC >= 0 && currC < BOARD_SIZE && board[currR][currC] === symbol) {
+                        count++;
+                        currR += dir.r; currC += dir.c;
+                    }
+                }
+                if (count >= 5) return true;
+            }
+            return false;
+        }
+
+        function endGame(isWin) {
+            gameActive = false;
+            modalTextEl.innerText = isWin ? "BẠN ĐÃ THẮNG! 🎉" : "BẠN ĐÃ THUA! ❌";
+            modalEl.style.display = 'flex';
+        }
+
+        function createRoom() {
+            const roomId = document.getElementById('roomIdInput').value.trim();
+            if (!/^\\d{5}$/.test(roomId)) return alert('Mã phòng phải đúng 5 chữ số!');
+            mode = 'pvp_room';
+            socket.emit('createRoom', roomId);
+        }
+
+        function joinRoom() {
+            const roomId = document.getElementById('roomIdInput').value.trim();
+            if (!/^\\d{5}$/.test(roomId)) return alert('Mã phòng phải đúng 5 chữ số!');
+            mode = 'pvp_room';
+            socket.emit('joinRoom', roomId);
+        }
+
+        function startQuickMatch() {
+            mode = 'pvp_quick';
+            socket.emit('quickMatch');
+            statusEl.innerText = "Đang tìm đối thủ...";
+            lobbyEl.style.display = 'none';
+            gameEl.style.display = 'flex';
+        }
+
+        function startVsAI() {
+            mode = 'ai';
+            mySymbol = 'X';
+            isMyTurn = true;
+            lobbyEl.style.display = 'none';
+            gameEl.style.display = 'flex';
+            resetGameData();
+            updateStatus();
+        }
+
+        // --- AI THÔNG MINH ---
+        function aiMove() {
+            if (!gameActive) return;
+            let bestScore = -Infinity, move = null;
+
+            for (let r = 0; r < BOARD_SIZE; r++) {
+                for (let c = 0; c < BOARD_SIZE; c++) {
+                    if (board[r][c] === null && hasNeighbor(r, c)) {
+                        let score = evaluateCell(r, c);
+                        if (score > bestScore) {
+                            bestScore = score;
+                            move = { r, c };
+                        }
+                    }
+                }
+            }
+
+            if (!move) move = { r: 7, c: 7 };
+
+            const aiSymbol = mySymbol === 'X' ? 'O' : 'X';
+            makeMove(move.r, move.c, aiSymbol);
+
+            if (checkWin(move.r, move.c, aiSymbol)) {
+                endGame(false);
+                return;
+            }
+
+            isMyTurn = true;
+            updateStatus();
+        }
+
+        function hasNeighbor(r, c) {
+            for (let dr = -2; dr <= 2; dr++) {
+                for (let dc = -2; dc <= 2; dc++) {
+                    let nr = r + dr, nc = c + dc;
+                    if (nr >= 0 && nr < BOARD_SIZE && nc >= 0 && nc < BOARD_SIZE && board[nr][nc] !== null) return true;
+                }
+            }
+            return false;
+        }
+
+        function evaluateCell(r, c) {
+            const aiSymbol = mySymbol === 'X' ? 'O' : 'X';
+            return getLineScore(r, c, aiSymbol) + getLineScore(r, c, mySymbol) * 1.3;
+        }
+
+        function getLineScore(r, c, symbol) {
+            const dirs = [{r:0, c:1}, {r:1, c:0}, {r:1, c:1}, {r:1, c:-1}];
+            let totalScore = 0;
+
+            for (let dir of dirs) {
+                let count = 1, openEnds = 0;
+                let currR = r + dir.r, currC = c + dir.c;
+                while (currR >= 0 && currR < BOARD_SIZE && currC >= 0 && currC < BOARD_SIZE && board[currR][currC] === symbol) {
+                    count++; currR += dir.r; currC += dir.c;
+                }
+                if (currR >= 0 && currR < BOARD_SIZE && currC >= 0 && currC < BOARD_SIZE && board[currR][currC] === null) openEnds++;
+
+                currR = r - dir.r; currC = c - dir.c;
+                while (currR >= 0 && currR < BOARD_SIZE && currC >= 0 && currC < BOARD_SIZE && board[currR][currC] === symbol) {
+                    count++; currR -= dir.r; currC -= dir.c;
+                }
+                if (currR >= 0 && currR < BOARD_SIZE && currC >= 0 && currC < BOARD_SIZE && board[currR][currC] === null) openEnds++;
+
+                if (count >= 5) totalScore += 100000;
+                else if (count === 4 && openEnds === 2) totalScore += 10000;
+                else if (count === 4 && openEnds === 1) totalScore += 2000;
+                else if (count === 3 && openEnds === 2) totalScore += 1000;
+                else if (count === 3 && openEnds === 1) totalScore += 100;
+            }
+            return totalScore;
+        }
+
+        function playAgain() {
+            modalEl.style.display = 'none';
+            if (mode === 'ai') {
+                startVsAI();
+            } else {
+                resetGameData();
+                socket.emit('requestRematch');
+                statusEl.innerText = "Chờ đối thủ đồng ý...";
+            }
+        }
+
+        function backToLobby() {
+            window.location.reload();
+        }
+
+        // --- SOCKET EVENT LISTENERS ---
+        socket.on('roomCreated', ({ roomId, symbol }) => {
+            mySymbol = symbol;
+            lobbyEl.style.display = 'none';
+            gameEl.style.display = 'flex';
+            statusEl.innerText = \`Đang đợi đối thủ vào phòng \${roomId}...\`;
+            resetGameData();
+            gameActive = false;
+        });
+
+        socket.on('roomJoined', ({ roomId, symbol }) => {
+            mySymbol = symbol;
+            lobbyEl.style.display = 'none';
+            gameEl.style.display = 'flex';
+            resetGameData();
+        });
+
+        socket.on('gameStart', ({ turn }) => {
+            gameActive = true;
+            isMyTurn = (mySymbol === turn);
+            updateStatus();
+        });
+
+        socket.on('opponentMove', ({ row, col, symbol }) => {
+            makeMove(row, col, symbol);
+            if (checkWin(row, col, symbol)) {
+                endGame(false);
+            } else {
+                isMyTurn = true;
+                updateStatus();
+            }
+        });
+
+        socket.on('rematchRequested', () => {
+            resetGameData();
+            isMyTurn = (mySymbol === 'X');
+            updateStatus();
+        });
+
+        socket.on('errorMsg', (msg) => alert(msg));
+        socket.on('playerLeft', () => {
+            alert('Đối thủ đã rời phòng!');
+            backToLobby();
+        });
+    </script>
+</body>
+</html>
+`;
+
+// Route trả về giao diện web trực tiếp
+app.get('/', (req, res) => {
+    res.send(htmlContent);
+});
+
+// --- 2. XỬ LÝ SERVER LOGIC & SOCKET.IO ---
+const rooms = new Map();
+let waitingPlayer = null;
+
+io.on('connection', (socket) => {
+
+    socket.on('createRoom', (roomId) => {
+        if (!/^\d{5}$/.test(roomId)) {
+            return socket.emit('errorMsg', 'ID phòng phải gồm đúng 5 chữ số (0-9).');
+        }
+        if (rooms.has(roomId)) {
+            return socket.emit('errorMsg', 'ID phòng đã tồn tại! Vui lòng chọn ID khác.');
+        }
+
+        socket.join(roomId);
+        rooms.set(roomId, { players: [socket.id] });
+        socket.roomId = roomId;
+        socket.symbol = 'X';
+        socket.emit('roomCreated', { roomId, symbol: 'X' });
+    });
+
+    socket.on('joinRoom', (roomId) => {
+        const room = rooms.get(roomId);
+        if (!room) return socket.emit('errorMsg', 'Phòng không tồn tại!');
+        if (room.players.length >= 2) return socket.emit('errorMsg', 'Phòng đã đủ 2 người chơi!');
+
+        socket.join(roomId);
+        room.players.push(socket.id);
+        socket.roomId = roomId;
+        socket.symbol = 'O';
+
+        socket.emit('roomJoined', { roomId, symbol: 'O' });
+        io.to(roomId).emit('gameStart', { turn: 'X' });
+    });
+
+    socket.on('quickMatch', () => {
+        if (waitingPlayer && waitingPlayer.id !== socket.id) {
+            const roomId = `quick_${waitingPlayer.id}_${socket.id}`;
+            socket.join(roomId);
+            waitingPlayer.join(roomId);
+
+            rooms.set(roomId, { players: [waitingPlayer.id, socket.id] });
+            
+            waitingPlayer.roomId = roomId;
+            waitingPlayer.symbol = 'X';
+            socket.roomId = roomId;
+            socket.symbol = 'O';
+
+            waitingPlayer.emit('roomJoined', { roomId, symbol: 'X' });
+            socket.emit('roomJoined', { roomId, symbol: 'O' });
+
+            io.to(roomId).emit('gameStart', { turn: 'X' });
+            waitingPlayer = null;
+        } else {
+            waitingPlayer = socket;
+            socket.emit('waitingMatch');
+        }
+    });
+
+    socket.on('makeMove', ({ row, col }) => {
+        if (socket.roomId) {
+            socket.to(socket.roomId).emit('opponentMove', { row, col, symbol: socket.symbol });
+        }
+    });
+
+    socket.on('requestRematch', () => {
+        if (socket.roomId) {
+            socket.to(socket.roomId).emit('rematchRequested');
+        }
+    });
+
+    socket.on('disconnect', () => {
+        if (waitingPlayer && waitingPlayer.id === socket.id) waitingPlayer = null;
+        if (socket.roomId && rooms.has(socket.roomId)) {
+            io.to(socket.roomId).emit('playerLeft');
+            rooms.delete(socket.roomId);
+        }
+    });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Server đang chạy tại http://localhost:${PORT}`);
+});
